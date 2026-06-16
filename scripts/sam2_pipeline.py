@@ -106,15 +106,27 @@ def points_xy_to_box_xywh(
     points_xy: np.ndarray,
     min_box_size: int = 8,
 ) -> np.ndarray:
-  """Builds a tight xywh box around a point cloud."""
+  """Builds a tight xywh box around a point cloud with outlier rejection."""
   points_xy = np.asarray(points_xy, dtype=np.float32)
   if points_xy.ndim != 2 or points_xy.shape[1] != 2:
     raise ValueError('points_xy must have shape [num_points, 2].')
 
-  x0 = float(points_xy[:, 0].min())
-  y0 = float(points_xy[:, 1].min())
-  x1 = float(points_xy[:, 0].max())
-  y1 = float(points_xy[:, 1].max())
+  median_xy = np.median(points_xy, axis=0)
+  absolute_deviation_xy = np.abs(points_xy - median_xy)
+  median_absolute_deviation_xy = np.maximum(
+      np.median(absolute_deviation_xy, axis=0),
+      1e-6,
+  )
+  keep_mask = np.all(
+      absolute_deviation_xy <= 3.0 * median_absolute_deviation_xy,
+      axis=1,
+  )
+  filtered_points_xy = points_xy[keep_mask] if np.any(keep_mask) else points_xy
+
+  x0 = float(filtered_points_xy[:, 0].min())
+  y0 = float(filtered_points_xy[:, 1].min())
+  x1 = float(filtered_points_xy[:, 0].max())
+  y1 = float(filtered_points_xy[:, 1].max())
   width = max(float(min_box_size), x1 - x0 + 1.0)
   height = max(float(min_box_size), y1 - y0 + 1.0)
   center_x = (x0 + x1) / 2.0
@@ -145,17 +157,60 @@ def paste_crop_mask_into_full_frame(
 def select_best_mask(
     masks: np.ndarray,
     scores: Optional[np.ndarray],
+    target_area: Optional[float] = None,
 ) -> tuple[int, np.ndarray]:
-  """Selects the highest-scoring SAM 2 mask."""
+  """Selects the SAM 2 mask that best matches a tiny target."""
   masks = np.asarray(masks)
   if masks.ndim == 2:
     return 0, masks.astype(bool)
 
-  if scores is None:
-    selected_index = 0
+  mask_areas = masks.sum(axis=(1, 2)).astype(np.float32)
+  valid_indices = np.flatnonzero(mask_areas > 0)
+  if len(valid_indices) == 0:
+    return 0, masks[0].astype(bool)
+
+  if target_area is not None:
+    selected_index = int(
+        valid_indices[
+            np.argmin(np.abs(mask_areas[valid_indices] - float(target_area)))
+        ]
+    )
   else:
-    selected_index = int(np.argmax(np.asarray(scores)))
+    del scores
+    selected_index = int(valid_indices[np.argmin(mask_areas[valid_indices])])
   return selected_index, masks[selected_index].astype(bool)
+
+
+def build_negative_prompt_points(
+    crop_points_xy: np.ndarray,
+    image_size_xy: Sequence[int],
+    padding: float = 3.0,
+) -> np.ndarray:
+  """Places a small negative fence around a positive point cluster."""
+  crop_points_xy = np.asarray(crop_points_xy, dtype=np.float32)
+  if crop_points_xy.ndim != 2 or crop_points_xy.shape[1] != 2:
+    raise ValueError('crop_points_xy must have shape [num_points, 2].')
+
+  width = max(int(image_size_xy[0]), 1)
+  height = max(int(image_size_xy[1]), 1)
+  x_min = float(crop_points_xy[:, 0].min()) - padding
+  x_max = float(crop_points_xy[:, 0].max()) + padding
+  y_min = float(crop_points_xy[:, 1].min()) - padding
+  y_max = float(crop_points_xy[:, 1].max()) + padding
+  x_center = (x_min + x_max) / 2.0
+  y_center = (y_min + y_max) / 2.0
+  negative_points_xy = np.array(
+      [
+          [x_min, y_center],
+          [x_max, y_center],
+          [x_center, y_min],
+          [x_center, y_max],
+      ],
+      dtype=np.float32,
+  )
+  negative_points_xy[:, 0] = np.clip(negative_points_xy[:, 0], 0.0, width - 1.0)
+  negative_points_xy[:, 1] = np.clip(negative_points_xy[:, 1], 0.0, height - 1.0)
+  return negative_points_xy
 
 
 def predict_mask_from_box(
@@ -193,7 +248,12 @@ def predict_mask_from_box(
       multimask_output=multimask_output,
       return_logits=return_logits,
   )
-  selected_index, mask_crop = select_best_mask(masks, scores)
+  target_area = float(crop_box_xywh[2] * crop_box_xywh[3])
+  selected_index, mask_crop = select_best_mask(
+      masks,
+      scores,
+      target_area=target_area,
+  )
   mask_full = paste_crop_mask_into_full_frame(
       mask_crop=mask_crop,
       crop_window=crop_window,
@@ -222,6 +282,8 @@ def predict_mask_from_points(
     min_crop_size: int = 64,
     multimask_output: bool = True,
     return_logits: bool = False,
+    include_negative_boundary_prompts: bool = True,
+    negative_point_padding: float = 3.0,
 ) -> Sam2PointPromptResult:
   """Prompts SAM 2 with positive points on a crop around a point cloud."""
   points_xy = np.asarray(points_xy, dtype=np.float32)
@@ -245,16 +307,37 @@ def predict_mask_from_points(
       crop_window=crop_window,
       output_size_xy=crop_output_size_xy,
   )
+  prompt_box_crop_xywh = points_xy_to_box_xywh(crop_points_xy, min_box_size=1)
+  target_area = float(prompt_box_crop_xywh[2] * prompt_box_crop_xywh[3])
 
   predictor.set_image(crop_frame)
+  prompt_points_xy = crop_points_xy
   point_labels = np.ones((len(crop_points_xy),), dtype=np.int32)
+  if include_negative_boundary_prompts:
+    negative_points_xy = build_negative_prompt_points(
+        crop_points_xy,
+        image_size_xy=crop_output_size_xy,
+        padding=negative_point_padding,
+    )
+    prompt_points_xy = np.concatenate([crop_points_xy, negative_points_xy], axis=0)
+    point_labels = np.concatenate(
+        [
+            point_labels,
+            np.zeros((len(negative_points_xy),), dtype=np.int32),
+        ],
+        axis=0,
+    )
   masks, scores, logits = predictor.predict(
-      point_coords=crop_points_xy,
+      point_coords=prompt_points_xy,
       point_labels=point_labels,
       multimask_output=multimask_output,
       return_logits=return_logits,
   )
-  selected_index, mask_crop = select_best_mask(masks, scores)
+  selected_index, mask_crop = select_best_mask(
+      masks,
+      scores,
+      target_area=target_area,
+  )
   mask_full = paste_crop_mask_into_full_frame(
       mask_crop=mask_crop,
       crop_window=crop_window,
@@ -303,6 +386,8 @@ def compute_keyframe_consensus(
       crop_window=crop_window,
       output_size_xy=crop_output_size_xy,
   )
+  prompt_box_crop_xywh = points_xy_to_box_xywh(crop_points_xy, min_box_size=1)
+  target_area = float(prompt_box_crop_xywh[2] * prompt_box_crop_xywh[3])
 
   predictor.set_image(crop_frame)
   point_masks_full = []
@@ -314,9 +399,12 @@ def compute_keyframe_consensus(
         multimask_output=True,
         return_logits=False,
     )
-    selected_index, mask_crop = select_best_mask(masks, scores)
-    del selected_index
-    point_scores.append(float(np.max(np.asarray(scores))))
+    selected_index, mask_crop = select_best_mask(
+      masks,
+      scores,
+      target_area=target_area,
+    )
+    point_scores.append(float(np.asarray(scores)[selected_index]))
     point_masks_full.append(
         paste_crop_mask_into_full_frame(
             mask_crop=mask_crop,
