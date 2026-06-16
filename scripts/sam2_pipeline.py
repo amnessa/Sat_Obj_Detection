@@ -213,6 +213,17 @@ def build_negative_prompt_points(
   return negative_points_xy
 
 
+def scale_target_area_to_crop(
+    true_target_area_px: float,
+    crop_window: CropWindow,
+    crop_output_size_xy: Sequence[int],
+) -> float:
+  """Scales a full-frame target area into the current crop resolution."""
+  scale_x = float(crop_output_size_xy[0]) / float(crop_window.width)
+  scale_y = float(crop_output_size_xy[1]) / float(crop_window.height)
+  return float(true_target_area_px) * scale_x * scale_y
+
+
 def predict_mask_from_box(
     predictor: SAM2ImagePredictor,
     frame: np.ndarray,
@@ -284,6 +295,7 @@ def predict_mask_from_points(
     return_logits: bool = False,
     include_negative_boundary_prompts: bool = True,
     negative_point_padding: float = 3.0,
+    true_target_area_px: Optional[float] = None,
 ) -> Sam2PointPromptResult:
   """Prompts SAM 2 with positive points on a crop around a point cloud."""
   points_xy = np.asarray(points_xy, dtype=np.float32)
@@ -307,8 +319,13 @@ def predict_mask_from_points(
       crop_window=crop_window,
       output_size_xy=crop_output_size_xy,
   )
-  prompt_box_crop_xywh = points_xy_to_box_xywh(crop_points_xy, min_box_size=1)
-  target_area = float(prompt_box_crop_xywh[2] * prompt_box_crop_xywh[3])
+  target_area = None
+  if true_target_area_px is not None:
+    target_area = scale_target_area_to_crop(
+        true_target_area_px=true_target_area_px,
+        crop_window=crop_window,
+        crop_output_size_xy=crop_output_size_xy,
+    )
 
   predictor.set_image(crop_frame)
   prompt_points_xy = crop_points_xy
@@ -363,6 +380,7 @@ def compute_keyframe_consensus(
     crop_context_scale: float = 3.0,
     crop_output_size_xy: Sequence[int] = (256, 256),
     min_crop_size: int = 64,
+  true_target_area_px: Optional[float] = None,
 ) -> Sam2ConsensusResult:
   """Runs Phase 4 per-point prompting and filters points by consensus."""
   points_xy = np.asarray(points_xy, dtype=np.float32)
@@ -386,8 +404,13 @@ def compute_keyframe_consensus(
       crop_window=crop_window,
       output_size_xy=crop_output_size_xy,
   )
-  prompt_box_crop_xywh = points_xy_to_box_xywh(crop_points_xy, min_box_size=1)
-  target_area = float(prompt_box_crop_xywh[2] * prompt_box_crop_xywh[3])
+  target_area = None
+  if true_target_area_px is not None:
+    target_area = scale_target_area_to_crop(
+        true_target_area_px=true_target_area_px,
+        crop_window=crop_window,
+        crop_output_size_xy=crop_output_size_xy,
+    )
 
   predictor.set_image(crop_frame)
   point_masks_full = []
@@ -400,9 +423,9 @@ def compute_keyframe_consensus(
         return_logits=False,
     )
     selected_index, mask_crop = select_best_mask(
-      masks,
-      scores,
-      target_area=target_area,
+        masks,
+        scores,
+        target_area=target_area,
     )
     point_scores.append(float(np.asarray(scores)[selected_index]))
     point_masks_full.append(

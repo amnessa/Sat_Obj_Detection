@@ -15,8 +15,22 @@ from scripts.sam2_pipeline import (
     predict_mask_from_points,
     sample_tapir_points_from_mask,
 )
-from scripts.tapir_pipeline import CausalTapirChunkTracker, ChunkTrackingResult
-from scripts.viso_pipeline import TrackletSpec, get_frame_chunk, load_tracklet_boxes, xywh_to_xyxy
+from scripts.tapir_pipeline import (
+    CausalTapirChunkTracker,
+    ChunkTrackingResult,
+    pixel_xy_to_query_points_tyx,
+)
+from scripts.viso_pipeline import (
+    CropWindow,
+  crop_and_resize,
+    TrackletSpec,
+    compute_crop_window,
+    get_frame_chunk,
+    load_tracklet_boxes,
+    map_points_from_crop,
+    map_points_to_crop,
+    xywh_to_xyxy,
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +211,77 @@ def compute_box_ious(
   return ious
 
 
+def crop_frames_to_window(
+    frames: np.ndarray,
+    crop_window: CropWindow,
+  output_size_xy: Sequence[int],
+) -> np.ndarray:
+  """Crops and resizes a frame chunk to a fixed local TAPIR working grid."""
+  return np.stack(
+    [
+      crop_and_resize(
+        frame,
+        crop_window=crop_window,
+        output_size_xy=output_size_xy,
+      )
+      for frame in frames
+    ],
+    axis=0,
+  ).astype(np.uint8)
+
+
+def track_chunk_with_local_tapir_crop(
+    tapir_tracker: CausalTapirChunkTracker,
+    frames: np.ndarray,
+    query_points_xy: np.ndarray,
+    crop_size: int = 256,
+    crop_context_scale: float = 1.0,
+) -> tuple[ChunkTrackingResult, CropWindow]:
+  """Tracks a chunk on a local full-resolution crop instead of a downsampled frame."""
+  prompt_box_xywh = points_xy_to_box_xywh(query_points_xy, min_box_size=crop_size)
+  crop_window = compute_crop_window(
+      box_xywh=prompt_box_xywh.tolist(),
+      image_shape=frames[0].shape,
+      context_scale=crop_context_scale,
+      min_crop_size=crop_size,
+  )
+  crop_output_size_xy = (crop_size, crop_size)
+  crop_frames = crop_frames_to_window(
+      frames,
+      crop_window=crop_window,
+      output_size_xy=crop_output_size_xy,
+  )
+  crop_query_points_xy = map_points_to_crop(
+      query_points_xy,
+      crop_window=crop_window,
+      output_size_xy=crop_output_size_xy,
+  )
+  crop_tracking_result = tapir_tracker.track_chunk(
+      frames=crop_frames,
+      query_points_xy=crop_query_points_xy,
+      inference_size_xy=None,
+  )
+  full_tracks_xy = map_points_from_crop(
+      crop_tracking_result.tracks_xy.reshape(-1, 2),
+      crop_window=crop_window,
+      output_size_xy=crop_output_size_xy,
+  ).reshape(crop_tracking_result.tracks_xy.shape)
+
+  return (
+      ChunkTrackingResult(
+          query_points_xy=np.asarray(query_points_xy, dtype=np.float32),
+          query_points_tyx=pixel_xy_to_query_points_tyx(query_points_xy),
+          tracks_xy=np.asarray(full_tracks_xy, dtype=np.float32),
+          tracks_xy_inference=crop_tracking_result.tracks_xy_inference,
+          occlusion_logits=crop_tracking_result.occlusion_logits,
+          expected_dist_logits=crop_tracking_result.expected_dist_logits,
+          visibles=crop_tracking_result.visibles,
+          inference_size_xy=crop_tracking_result.inference_size_xy,
+      ),
+      crop_window,
+  )
+
+
 def evaluate_keyframe_tracking(
     tracking_result: SequenceTrackingResult,
     center_threshold_px: float = 5.0,
@@ -241,6 +326,8 @@ def track_tracklet_with_keyframe_refresh(
     crop_output_size_xy: Sequence[int] = (256, 256),
     min_crop_size: int = 64,
     seed: int = 0,
+    tapir_crop_size: int = 256,
+    tapir_crop_context_scale: float = 1.0,
 ) -> SequenceTrackingResult:
   """Runs the SAM 2 <-> TAPIR loop across an entire VISO tracklet.
 
@@ -275,6 +362,7 @@ def track_tracklet_with_keyframe_refresh(
       seed=seed,
   )
   initial_points_xy = np.asarray(current_points_xy, dtype=np.float32)
+  true_target_area_px = float(initial_mask_result.mask_full.sum())
 
   keyframe_results = []
   chunk_start_offsets = compute_chunk_start_offsets(
@@ -282,12 +370,10 @@ def track_tracklet_with_keyframe_refresh(
       chunk_size=chunk_size,
       chunk_stride=resolved_chunk_stride,
   )
-  resolved_inference_size_xy = None
-  if inference_size_xy is not None:
-    resolved_inference_size_xy = (
-        int(inference_size_xy[0]),
-        int(inference_size_xy[1]),
-    )
+  if tapir_crop_size <= 0:
+    raise ValueError('tapir_crop_size must be positive.')
+  if tapir_crop_context_scale < 1.0:
+    raise ValueError('tapir_crop_context_scale must be at least 1.0.')
 
   for chunk_index, start_offset in enumerate(chunk_start_offsets.tolist()):
     chunk = get_frame_chunk(
@@ -295,17 +381,19 @@ def track_tracklet_with_keyframe_refresh(
         start_offset=int(start_offset),
         chunk_size=chunk_size,
     )
-    tapir_result = tapir_tracker.track_chunk(
+    tapir_result, tapir_crop_window = track_chunk_with_local_tapir_crop(
+        tapir_tracker=tapir_tracker,
         frames=chunk.frames,
         query_points_xy=current_points_xy,
-        inference_size_xy=resolved_inference_size_xy,
+        crop_size=tapir_crop_size,
+        crop_context_scale=tapir_crop_context_scale,
     )
+    del tapir_crop_window
 
     final_visible_mask = tapir_result.visibles[-1].astype(bool)
     final_visible_points_xy = tapir_result.final_points_xy[final_visible_mask]
     if len(final_visible_points_xy) == 0:
       final_visible_points_xy = tapir_result.final_points_xy
-
     consensus_result = compute_keyframe_consensus(
         predictor=predictor,
         frame=chunk.frames[-1],
@@ -313,6 +401,7 @@ def track_tracklet_with_keyframe_refresh(
         crop_context_scale=crop_context_scale,
         crop_output_size_xy=crop_output_size_xy,
         min_crop_size=min_crop_size,
+        true_target_area_px=true_target_area_px,
     )
     kept_points_xy = consensus_result.kept_points_xy
     if len(kept_points_xy) == 0:
@@ -325,6 +414,7 @@ def track_tracklet_with_keyframe_refresh(
         crop_context_scale=crop_context_scale,
         crop_output_size_xy=crop_output_size_xy,
         min_crop_size=min_crop_size,
+        true_target_area_px=true_target_area_px,
     )
 
     if np.any(renewed_mask_result.mask_full):
@@ -367,7 +457,7 @@ def track_tracklet_with_keyframe_refresh(
       chunk_size=chunk_size,
       chunk_stride=resolved_chunk_stride,
       num_query_points=num_query_points,
-      inference_size_xy=resolved_inference_size_xy,
+        inference_size_xy=(tapir_crop_size, tapir_crop_size),
       initial_points_xy=initial_points_xy,
       initial_mask_pixels=int(initial_mask_result.mask_full.sum()),
       keyframes=tuple(keyframe_results),
