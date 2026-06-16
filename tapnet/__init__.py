@@ -15,7 +15,40 @@
 
 """Legacy API for TAP.  Prefer importing from project subfolders."""
 
-from tapnet.models import tapir_model  # pylint:disable=g-importing-member
-from tapnet.models import tapnet_model  # pylint:disable=g-importing-member
-from tapnet.robotap import tapir_clustering  # pylint:disable=g-importing-member
-from tapnet.tapvid import evaluation_datasets  # pylint:disable=g-importing-member
+from importlib import import_module
+from typing import Any, TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+  from tapnet.models import tapir_model as tapir_model
+  from tapnet.models import tapnet_model as tapnet_model
+  from tapnet.robotap import tapir_clustering as tapir_clustering
+  from tapnet.tapvid import evaluation_datasets as evaluation_datasets
+
+
+__all__ = [
+    'tapir_model',
+    'tapnet_model',
+    'tapir_clustering',
+    'evaluation_datasets',
+]
+
+_LEGACY_MODULES = {
+    'tapir_model': 'tapnet.models.tapir_model',
+    'tapnet_model': 'tapnet.models.tapnet_model',
+    'tapir_clustering': 'tapnet.robotap.tapir_clustering',
+    'evaluation_datasets': 'tapnet.tapvid.evaluation_datasets',
+}
+
+
+def __getattr__(name: str) -> Any:
+  try:
+    module_name = _LEGACY_MODULES[name]
+  except KeyError as exc:
+    raise AttributeError(
+        f'module {__name__!r} has no attribute {name!r}'
+    ) from exc
+
+  module = import_module(module_name)
+  globals()[name] = module
+  return module
